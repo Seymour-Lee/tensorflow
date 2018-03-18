@@ -63,6 +63,25 @@ struct ApplyGradientDescentSYCL {
 #endif
 
 template <typename T>
+struct ApplyParticleSwarm<CPUDevice, T> {
+  void operator()(const CPUDevice& d, typename TTypes<T>::Flat var,
+                  typename TTypes<T>::ConstScalar lr,
+                  typename TTypes<T>::ConstFlat grad) {
+    var.device(d) -= grad * lr();
+  }
+};
+
+#ifdef TENSORFLOW_USE_SYCL
+template <typename T>
+struct ApplyParticleSwarmSYCL {
+  void operator()(const SYCLDevice& d, typename TTypes<T>::Flat var, T lr,
+                  typename TTypes<T>::ConstFlat grad) {
+    var.device(d) -= grad * lr;
+  }
+};
+#endif
+
+template <typename T>
 struct ApplyAdadelta<CPUDevice, T> {
   void operator()(const CPUDevice& d, typename TTypes<T>::Flat var,
                   typename TTypes<T>::Flat accum,
@@ -475,6 +494,139 @@ namespace functor {
       typename TTypes<T>::ConstScalar alpha,            \
       typename TTypes<T>::ConstFlat delta);             \
   extern template struct ApplyGradientDescent<GPUDevice, T>;
+DECLARE_GPU_SPEC(Eigen::half);
+DECLARE_GPU_SPEC(float);
+DECLARE_GPU_SPEC(double);
+#undef DECLARE_GPU_SPEC
+}  // namespace functor
+
+REGISTER_KERNELS(GPU, Eigen::half);
+REGISTER_KERNELS(GPU, float);
+REGISTER_KERNELS(GPU, double);
+#endif
+
+#ifdef TENSORFLOW_USE_SYCL
+#define REGISTER_SYCL_KERNELS(T) REGISTER_KERNELS(SYCL, T);
+TF_CALL_float(REGISTER_SYCL_KERNELS);
+TF_CALL_double(REGISTER_SYCL_KERNELS);
+#undef REGISTER_SYCL_KERNELS
+#endif  // TENSORFLOW_USE_SYCL
+
+#undef REGISTER_CPU_KERNELS
+#undef REGISTER_KERNELS
+
+template <typename Device, typename T>
+class ApplyParticleSwarmOp : public OpKernel {
+ public:
+  explicit ApplyParticleSwarmOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+  }
+
+  void Compute(OpKernelContext* ctx) override {
+    auto locks =
+        MaybeLockVariableInputMutexesInOrder(ctx, use_exclusive_lock_, {0});
+    Tensor var;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<Device, T>(
+                            ctx, 0, use_exclusive_lock_, false, &var));
+
+    OP_REQUIRES(
+        ctx, var.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(0)));
+    const Tensor& alpha = ctx->input(1);
+    OP_REQUIRES(ctx, IsLegacyScalar(alpha.shape()),
+                errors::InvalidArgument("alpha is not a scalar: ",
+                                        alpha.shape().DebugString()));
+    const Tensor& delta = ctx->input(2);
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(delta.shape()),
+        errors::InvalidArgument("var and delta do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                delta.shape().DebugString()));
+
+    const Device& device = ctx->template eigen_device<Device>();
+    functor::ApplyParticleSwarm<Device, T>()(
+        device, var.flat<T>(), alpha.scalar<T>(), delta.flat<T>());
+
+    MaybeForwardRefInputToRefOutput(ctx, 0, 0);
+  }
+
+ private:
+  bool use_exclusive_lock_;
+};
+
+#ifdef TENSORFLOW_USE_SYCL
+template <typename T>
+class ApplyParticleSwarmOp<SYCLDevice, T> : public OpKernel {
+ public:
+  explicit ApplyParticleSwarmOp(OpKernelConstruction* ctx) : OpKernel(ctx) {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("use_locking", &use_exclusive_lock_));
+  }
+
+  void Compute(OpKernelContext* ctx) override {
+    auto locks =
+        MaybeLockVariableInputMutexesInOrder(ctx, use_exclusive_lock_, {0});
+    Tensor var;
+    OP_REQUIRES_OK(ctx, GetInputTensorFromVariable<SYCLDevice, T>(
+                            ctx, 0, use_exclusive_lock_, false, &var));
+
+    OP_REQUIRES(
+        ctx, var.IsInitialized(),
+        errors::FailedPrecondition(
+            "Attempting to use uninitialized variables: ", requested_input(0)));
+    const Tensor& alpha_dev = ctx->input(1);
+    OP_REQUIRES(ctx, IsLegacyScalar(alpha_dev.shape()),
+                errors::InvalidArgument("alpha is not a scalar: ",
+                                        alpha_dev.shape().DebugString()));
+    const Tensor& delta = ctx->input(2);
+    OP_REQUIRES(
+        ctx, var.shape().IsSameSize(delta.shape()),
+        errors::InvalidArgument("var and delta do not have the same shape",
+                                var.shape().DebugString(), " ",
+                                delta.shape().DebugString()));
+
+    auto device = ctx->eigen_sycl_device();
+    auto size = sizeof(T);
+    T alpha = T(0);
+    auto src_ptr = GetBase(&alpha_dev);
+    device.memcpyDeviceToHost(&alpha, static_cast<const T*>(src_ptr), size);
+
+    functor::ApplyParticleSwarmSYCL<T>()(device, var.flat<T>(), alpha,
+                                           delta.flat<T>());
+
+    MaybeForwardRefInputToRefOutput(ctx, 0, 0);
+  }
+
+ private:
+  bool use_exclusive_lock_;
+};
+#endif  // TENSORFLOW_USE_SYCL
+
+#define REGISTER_KERNELS(D, T)                                                \
+  REGISTER_KERNEL_BUILDER(                                                    \
+      Name("ApplyParticleSwarm").Device(DEVICE_##D).TypeConstraint<T>("T"), \
+      ApplyParticleSwarmOp<D##Device, T>);                                  \
+  REGISTER_KERNEL_BUILDER(Name("ResourceApplyParticleSwarm")                \
+                              .Device(DEVICE_##D)                             \
+                              .HostMemory("var")                              \
+                              .TypeConstraint<T>("T"),                        \
+                          ApplyParticleSwarmOp<D##Device, T>);
+#define REGISTER_CPU_KERNELS(T) REGISTER_KERNELS(CPU, T);
+
+TF_CALL_half(REGISTER_CPU_KERNELS);
+TF_CALL_float(REGISTER_CPU_KERNELS);
+TF_CALL_double(REGISTER_CPU_KERNELS);
+
+#if GOOGLE_CUDA
+// Forward declarations of the functor specializations for GPU.
+namespace functor {
+#define DECLARE_GPU_SPEC(T)                             \
+  template <>                                           \
+  void ApplyParticleSwarm<GPUDevice, T>::operator()(  \
+      const GPUDevice& d, typename TTypes<T>::Flat var, \
+      typename TTypes<T>::ConstScalar alpha,            \
+      typename TTypes<T>::ConstFlat delta);             \
+  extern template struct ApplyParticleSwarm<GPUDevice, T>;
 DECLARE_GPU_SPEC(Eigen::half);
 DECLARE_GPU_SPEC(float);
 DECLARE_GPU_SPEC(double);

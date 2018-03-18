@@ -19,6 +19,7 @@ See the @{$python/train} guide.
 
 @@Optimizer
 @@GradientDescentOptimizer
+@@ParticleSwarmOptimizer
 @@AdadeltaOptimizer
 @@AdagradOptimizer
 @@AdagradDAOptimizer
@@ -119,6 +120,7 @@ from tensorflow.python.training.moving_averages import ExponentialMovingAverage
 from tensorflow.python.training.optimizer import Optimizer
 from tensorflow.python.training.rmsprop import RMSPropOptimizer
 from tensorflow.python.training.gradient_descent import GradientDescentOptimizer
+from tensorflow.python.training.particle_swarm import ParticleSwarmOptimizer
 from tensorflow.python.training.proximal_gradient_descent import ProximalGradientDescentOptimizer
 from tensorflow.python.training.sync_replicas_optimizer import SyncReplicasOptimizer
 

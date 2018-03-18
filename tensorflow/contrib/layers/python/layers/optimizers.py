@@ -44,6 +44,7 @@ OPTIMIZER_CLS_NAMES = {
     "Momentum": train.MomentumOptimizer,
     "RMSProp": train.RMSPropOptimizer,
     "SGD": train.GradientDescentOptimizer,
+    "PSO":train.ParticleSwarmOptimizer,
 }
 
 OPTIMIZER_SUMMARIES = [

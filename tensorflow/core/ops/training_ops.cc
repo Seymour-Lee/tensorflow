@@ -103,6 +103,53 @@ use_locking: If `True`, the subtraction will be protected by a lock;
   otherwise the behavior is undefined, but may exhibit less contention.
 )doc");
 
+static Status ApplyParticleSwarmShapeFn(InferenceContext* c) {
+  ShapeHandle unused;
+  ShapeHandle s = ShapeOrHandleShape(c, 0);                  // var
+  TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));  // alpha
+  TF_RETURN_IF_ERROR(c->Merge(s, c->input(2), &s));          // delta
+  if (c->num_outputs() > 0) {
+    c->set_output(0, s);
+  }
+  return Status::OK();
+}
+
+REGISTER_OP("ApplyParticleSwarm")
+    .Input("var: Ref(T)")
+    .Input("alpha: T")
+    .Input("delta: T")
+    .Output("out: Ref(T)")
+    .Attr("T: numbertype")
+    .Attr("use_locking: bool = false")
+    .SetShapeFn(ApplyParticleSwarmShapeFn)
+    .Doc(R"doc(
+Update '*var' by subtracting 'alpha' * 'delta' from it.
+
+var: Should be from a Variable().
+alpha: Scaling factor. Must be a scalar.
+delta: The change.
+out: Same as "var".
+use_locking: If `True`, the subtraction will be protected by a lock;
+  otherwise the behavior is undefined, but may exhibit less contention.
+)doc");
+
+REGISTER_OP("ResourceApplyParticleSwarm")
+    .Input("var: resource")
+    .Input("alpha: T")
+    .Input("delta: T")
+    .Attr("T: numbertype")
+    .Attr("use_locking: bool = false")
+    .SetShapeFn(ApplyParticleSwarmShapeFn)
+    .Doc(R"doc(
+Update '*var' by subtracting 'alpha' * 'delta' from it.
+
+var: Should be from a Variable().
+alpha: Scaling factor. Must be a scalar.
+delta: The change.
+use_locking: If `True`, the subtraction will be protected by a lock;
+  otherwise the behavior is undefined, but may exhibit less contention.
+)doc");
+
 static Status ApplyProximalGradientDescentShapeFn(InferenceContext* c,
                                                   bool sparse) {
   ShapeHandle unused;
