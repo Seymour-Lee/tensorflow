@@ -50,7 +50,7 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
   GATE_OP = 1
   GATE_GRAPH = 2
 
-  def __init__(self, learning_rate=0.01, m=20, w=0.8, c1=2, c2=2, beta1=0.9, beta2=0.99, epsilon=1e-8, use_locking=False, name="ParticleSwarm"):
+  def __init__(self, learning_rate=0.01, m=20, w=0.8, c1=2, c2=2, use_locking=False, name="ParticleSwarm"):
     """Construct a new AMSGrad optimizer.
     Args:
         learning_rate: A Tensor or a floating point value. The 
@@ -65,17 +65,8 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
     """
     super(ParticleSwarmOptimizer, self).__init__(use_locking, name)
     self._lr = learning_rate
-    self._beta1 = beta1
-    self._beta2 = beta2
-    self._epsilon = epsilon
 
     self._lr_t = None
-    self._beta1_t = None
-    self._beta2_t = None
-    self._epsilon_t = None
-
-    self._beta1_power = None
-    self._beta2_power = None
 
     self._m = m
     self._w = w
@@ -93,25 +84,10 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
     self._calculate_list = None
 
   def _create_slots(self, var_list):
-    first_var = min(var_list, key=lambda x: x.name)
-
-    create_new = self._beta1_power is None
-    if not create_new and context.in_graph_mode():
-        create_new = (self._beta1_power.graph is not first_var.graph)
-
-    if create_new:
-        with ops.colocate_with(first_var):
-            self._beta1_power = variable_scope.variable(self._beta1, name="beta1_power", trainable=False)
-            self._beta2_power = variable_scope.variable(self._beta2, name="beta2_power", trainable=False)
-
     # TO DO: for each var, create following slots: partile[m], pbest, gbest DONE!
 
     # Create slots for the first and second moments.
     for v in var_list :
-        self._zeros_slot(v, "m", self._name)
-        self._zeros_slot(v, "v", self._name)
-        self._zeros_slot(v, "vhat", self._name)
-
         self._zeros_slot(v, "gBest", self._name)
         self._zeros_slot(v, "pBest", self._name)
         self._zeros_slot(v, "r1", self._name)
@@ -122,11 +98,6 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
           self._zeros_slot(v, "v_" + str(i), self._name)
 
   def _prepare(self):
-    self._lr_t = ops.convert_to_tensor(self._lr, name="learning_rate")
-    self._beta1_t = ops.convert_to_tensor(self._beta1, name="beta1")
-    self._beta2_t = ops.convert_to_tensor(self._beta2, name="beta2")
-    self._epsilon_t = ops.convert_to_tensor(self._epsilon, name="epsilon")
-
     # TO DO: instantiaze all _var_name_t in __init__() DONE!
     self._m_t = ops.convert_to_tensor(self._m, name="m")
     self._w_t = ops.convert_to_tensor(self._w, name="w")
@@ -137,41 +108,11 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
     # print("var is :")
     # print(var)
 
-    beta1_power = math_ops.cast(self._beta1_power, var.dtype.base_dtype)
-    beta2_power = math_ops.cast(self._beta2_power, var.dtype.base_dtype)
-    lr_t = math_ops.cast(self._lr_t, var.dtype.base_dtype)
-    beta1_t = math_ops.cast(self._beta1_t, var.dtype.base_dtype)
-    beta2_t = math_ops.cast(self._beta2_t, var.dtype.base_dtype)
-    epsilon_t = math_ops.cast(self._epsilon_t, var.dtype.base_dtype)
-
     # TO DO: cast all var_name_t into math_ops DONE!
     m_t = math_ops.cast(self._m_t, var.dtype.base_dtype)
     w_t = math_ops.cast(self._w_t, var.dtype.base_dtype)
     c1_t = math_ops.cast(self._c1_t, var.dtype.base_dtype)
     c2_t = math_ops.cast(self._c2_t, var.dtype.base_dtype)
-
-    lr = (lr_t * math_ops.sqrt(1 - beta2_power) / (1 - beta1_power))
-
-    # m_t = beta1 * m + (1 - beta1) * g_t
-    m = self.get_slot(var, "m")
-    # print(m)
-    # print(m.get_shape())
-    m_scaled_g_values = grad * (1 - beta1_t)
-    m_t = state_ops.assign(m, beta1_t * m + m_scaled_g_values, use_locking=self._use_locking)
-
-    # v_t = beta2 * v + (1 - beta2) * (g_t * g_t)
-    v = self.get_slot(var, "v")
-    # print(v)
-    v_scaled_g_values = (grad * grad) * (1 - beta2_t)
-    v_t = state_ops.assign(v, beta2_t * v + v_scaled_g_values, use_locking=self._use_locking)
-
-    # amsgrad
-    vhat = self.get_slot(var, "vhat")
-    # print(vhat)
-    vhat_t = state_ops.assign(vhat, math_ops.maximum(v_t, vhat))
-    v_sqrt = math_ops.sqrt(vhat_t)
-
-    var_update = state_ops.assign_sub(var, lr * m_t / (v_sqrt + epsilon_t), use_locking=self._use_locking)
 
     # print("in _apply_dense():")
     # print(var_update, m_t, v_t, vhat_t)
@@ -189,6 +130,9 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
     pBest = self.get_slot(var, "pBest")
     r1 = self.get_slot(var, "r1")
     r2 = self.get_slot(var, "r2")
+
+    # calculate_list might be insert in zero position, rather than append to the list tail
+
     for d in range(self._m):
       v_d = self.get_slot(var, "v_" + str(d))
       p_d = self.get_slot(var, "p_" + str(d))
@@ -207,40 +151,6 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
 
     return control_flow_ops.group(*calculate_list)
 
-    # return control_flow_ops.group(*[var_update, m_t, v_t, vhat_t])
-
-  # """Optimizer that implements the gradient descent algorithm.
-  # """
-
-  # def __init__(self, learning_rate, m=20, w=0.8, c1=2, c2=2, use_locking=False, name="ParticleSwarm"):
-  #   """Construct a new gradient descent optimizer.
-
-  #   Args:
-  #     learning_rate: A Tensor or a floating point value.  The learning
-  #       rate to use.
-  #     use_locking: If True use locks for update operations.
-  #     name: Optional name prefix for the operations created when applying
-  #       gradients. Defaults to "ParticleSwarm".
-  #   """
-  #   super(ParticleSwarmOptimizer, self).__init__(use_locking, name)
-  #   self._learning_rate = learning_rate
-  #   self._m = m
-  #   self._w = w
-  #   self._c1 = c1
-  #   self._c2 = c2
-
-  # def _apply_dense(self, grad, var):
-  #   print("---------------------")
-  #   print(var)
-  #   print(grad)
-  #   print("---------------------")
-
-  #   return training_ops.apply_particle_swarm(
-  #       var,
-  #       math_ops.cast(self._learning_rate_tensor, var.dtype.base_dtype),
-  #       grad,
-  #       use_locking=self._use_locking).op
-
   def _resource_apply_dense(self, grad, handle):
     return training_ops.resource_apply_particle_swarm(
         handle.handle, math_ops.cast(self._learning_rate_tensor,
@@ -258,20 +168,14 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
         grad.indices, grad.dense_shape)
     return var.scatter_sub(delta, use_locking=self._use_locking)
 
-  # def _prepare(self):
-  #   self._learning_rate_tensor = ops.convert_to_tensor(self._learning_rate,
-  #                                                      name="learning_rate")
-  #   self._w_tensor = ops.convert_to_tensor(self._w, name="weight")
-  #   self._c1_tensor = ops.convert_to_tensor(self._c1, name="learning_rate_c1")
-  #   self._c2_tensor = ops.convert_to_tensor(self._c2, name="learning_rate_c2")
-
   def minimize(self, loss, global_step=None, var_list=None,
                gate_gradients=GATE_OP, aggregation_method=None,
                colocate_gradients_with_ops=False, name=None,
                grad_loss=None):
     self._loss = loss
     print("in child class : minimizer()")
-    print(self._loss)
+    print(id(self._loss), id(loss))
+
 
     if self._var_list is None:
       self._var_list = (
@@ -318,7 +222,8 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
     for var in self._var_list:
         gBest_d = self.get_slot(var, "gBest")
         gBest_t = state_ops.assign(var, gBest_d)
-        calculate_list.insert(0, gBest_t)
+        # calculate_list.insert(0, gBest_t)
+        calculate_list.append(gBest_t)
     loss_gBest = sess.run(self._loss)
 
     for i in range(self._m):
@@ -326,7 +231,8 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
       for var in self._var_list:
         p_i_d = self.get_slot(var, "p_" + str(i))
         var_t = state_ops.assign(var, p_i_d)
-        calculate_list.insert(0, var_t)
+        # calculate_list.insert(0, var_t)
+        calculate_list.append(var_t)
       loss_p_i = sess.run(self._loss)
       print("loss_p_i", loss_p_i)
 
@@ -334,7 +240,8 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
       for var in self._var_list:
         pBest_i_d = self.get_slot(var, "pBest")
         pBest_t = state_ops.assign(var, pBest_i_d)
-        calculate_list.insert(0, pBest_t)
+        # calculate_list.insert(0, pBest_t)
+        calculate_list.append(pBest_t)
       loss_pBest_i = sess.run(self._loss)
       print("loss_pBest_i", loss_pBest_i)
 
@@ -347,21 +254,24 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
         gBest_d = self.get_slot(var, "gBest")
         # cast loss_value into tensor
         pBest_t = state_ops.assign(pBest_i_d, math_ops.cast(ops.convert_to_tensor(loss_p_i < loss_pBest_i, name="p_pBest_0"), var.dtype.base_dtype) * p_i_d)
-        calculate_list.insert(0, pBest_t)
+        # calculate_list.insert(0, pBest_t)
+        calculate_list.append(pBest_t)
         loss_pBest_i = math_ops.minimum(loss_p_i, loss_pBest_i)
         gBest_t = state_ops.assign(gBest_d, math_ops.cast(ops.convert_to_tensor(loss_p_i < loss_pBest_i, name="p_pBest_1"), var.dtype.base_dtype) 
                                             * math_ops.cast(ops.convert_to_tensor(loss_pBest_i < loss_gBest, name="pBest_gBest"), var.dtype.base_dtype) 
                                             * p_i_d)
-        calculate_list.insert(0, gBest_t)
+        # calculate_list.insert(0, gBest_t)
+        calculate_list.append(gBest_t)
         loss_gBest = math_ops.minimum(loss_pBest_i, loss_gBest)
       print("loss_gBest", loss_gBest)
 
     calculate_list = control_flow_ops.group(*calculate_list)
     print("------------------")
-    print(calculate_list)
+    # print(calculate_list)
     print("------------------")
-    update_ops.insert(0, calculate_list)
-    print(*update_ops)    
+    # update_ops.insert(0, calculate_list)
+    update_ops.append(calculate_list)
+    # print(*update_ops)    
     return control_flow_ops.group(*update_ops, name=name_scope)
 
   def _random_slot(self, var, slot_name, op_name):
