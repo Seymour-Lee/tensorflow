@@ -34,15 +34,18 @@ from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops import variables
 from tensorflow.python.ops import random_ops
 from tensorflow.python.training import optimizer
+from tensorflow.python.training import slot_creator
 
 from tensorflow.python.client import session as tf_session
 
-
+def _var_key(var):
+  if context.in_eager_mode():
+    return var._shared_name  # pylint: disable=protected-access
+  return (var.op.graph, var.op.name)
 
 class ParticleSwarmOptimizer(optimizer.Optimizer):
-  """Optimizer that implements the AMSGrad algorithm.
-    See (https://openreview.net/pdf?id=ryQu7f-RZ)
-    
+  """
+    Optimizer that implements the Particle Swarm algorithm.
   """
 
   # Values for gate_gradients.
@@ -85,18 +88,16 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
 
   def _create_slots(self, var_list):
     # TO DO: for each var, create following slots: partile[m], pbest, gbest DONE!
-
     # Create slots for the first and second moments.
     for v in var_list :
-        self._zeros_slot(v, "gBest", self._name)
-        # self._zeros_slot(v, "pBest", self._name)
-        self._zeros_slot(v, "r1", self._name)
-        self._zeros_slot(v, "r2", self._name)
+        self._random_slot(v, "gBest", self._name)
+        self._random_slot(v, "r1", self._name)
+        self._random_slot(v, "r2", self._name)
 
         for i in range(self._m):
-          self._zeros_slot(v, "pBest_" + str(i), self._name)
-          self._zeros_slot(v, "p_" + str(i), self._name)
-          self._zeros_slot(v, "v_" + str(i), self._name)
+          self._random_slot(v, "pBest_" + str(i), self._name)
+          self._random_slot(v, "p_" + str(i), self._name)
+          self._random_slot(v, "v_" + str(i), self._name)
 
   def _prepare(self):
     # TO DO: instantiaze all _var_name_t in __init__() DONE!
@@ -106,54 +107,35 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
     self._c2_t = ops.convert_to_tensor(self._c2, name="c2")
 
   def _apply_dense(self, grad, var):
-    # print("var is :")
-    # print(var)
-
     # TO DO: cast all var_name_t into math_ops DONE!
     m_t = math_ops.cast(self._m_t, var.dtype.base_dtype)
     w_t = math_ops.cast(self._w_t, var.dtype.base_dtype)
     c1_t = math_ops.cast(self._c1_t, var.dtype.base_dtype)
     c2_t = math_ops.cast(self._c2_t, var.dtype.base_dtype)
 
-    # print("in _apply_dense():")
-    # print(var_update, m_t, v_t, vhat_t)
-    # print("-----------------------")
-    # print(control_flow_ops.group(*[var_update, m_t, v_t, vhat_t]))
-    # print("end _apply_dense()")
-
     # TO DO: calculate current var-d DONE!
     calculate_list = []
 
     gBest = self.get_slot(var, "gBest")
     var_shape = gBest.get_shape()
-    # print(gBest.get_shape())
-    # print(var_shape)
-    # pBest = self.get_slot(var, "pBest")
     r1 = self.get_slot(var, "r1")
     r2 = self.get_slot(var, "r2")
 
     # calculate_list might be insert in zero position, rather than append to the list tail
-
     for d in range(self._m):
       v_d = self.get_slot(var, "v_" + str(d))
       p_d = self.get_slot(var, "p_" + str(d))
       pBest_d = self.get_slot(var, "pBest_" + str(d))
       # The following two lines may have problem, because when running this positon, the compute graph is not running
       # The following two lines have been changed, but I am not sure they are correct
-      r1_t = state_ops.assign(r1, random_ops.random_uniform(var_shape, 0, 1)) # find out how to generate a random value, which belongs to (0, 1)
-      r2_t = state_ops.assign(r2, random_ops.random_uniform(var_shape, 0, 1))
+      r1_t = state_ops.assign(r1, random_ops.random_uniform(var_shape, 0, 2)) # how to determine the scope of random value
+      r2_t = state_ops.assign(r2, random_ops.random_uniform(var_shape, 0, 2))
       # vi,d = w * vi,d + c1 * r1 * (pBest - var) + c2 * r2 * (gBest - var)
       v_d_t = state_ops.assign(v_d, w_t * v_d + c1_t * r1_t * (pBest_d - var) + c2_t * r2_t * (gBest - var))
       # var = var + vi,d
       p_d_t = state_ops.assign_add(p_d, v_d_t)
       calculate_list.append(p_d_t)
       calculate_list.append(v_d_t)
-      # print(p_d_t, v_d_t)
-      # print(calculate_list)
-
-    # Test code
-    var_t = state_ops.assign(var, p_d)
-    calculate_list.append(var_t)
 
     return control_flow_ops.group(*calculate_list)
 
@@ -179,9 +161,6 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
                colocate_gradients_with_ops=False, name=None,
                grad_loss=None):
     self._loss = loss
-    print("in child class : minimizer()")
-    print(id(self._loss), id(loss))
-
 
     if self._var_list is None:
       self._var_list = (
@@ -191,136 +170,109 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
       self._var_list = nest.flatten(self._var_list)
     # pylint: disable=protected-access
     self._var_list += ops.get_collection(ops.GraphKeys._STREAMING_MODEL_PORTS)
-    print(self._var_list)
-    sess = tf_session.Session()
-    for var in self._var_list:
-      print(var)
-      # print(sess.run(var))
 
     ret = super(ParticleSwarmOptimizer, self).minimize(loss, global_step, var_list,
                gate_gradients, aggregation_method,
                colocate_gradients_with_ops, name,
                grad_loss)
-    print(ret)
     return ret
     
 
-  # def _finish(self, update_ops, name_scope):
-  #   """Do what is needed to finish the update.
+  def _finish(self, update_ops, name_scope):
+    """Do what is needed to finish the update.
 
-  #   This is called with the `name_scope` using the "name" that
-  #   users have chosen for the application of gradients.
+    This is called with the `name_scope` using the "name" that
+    users have chosen for the application of gradients.
 
-  #   Args:
-  #     update_ops: List of `Operation` objects to update variables.  This list
-  #       contains the values returned by the `_apply_dense()` and
-  #       `_apply_sparse()` calls.
-  #     name_scope: String.  Name to use for the returned operation.
+    Args:
+      update_ops: List of `Operation` objects to update variables.  This list
+        contains the values returned by the `_apply_dense()` and
+        `_apply_sparse()` calls.
+      name_scope: String.  Name to use for the returned operation.
 
-  #   Returns:
-  #     The operation to apply updates.
-  #   """
-  #   print("in child class : _finish()")
-  #   # print(update_ops)
-  #   # print(*update_ops)
-  #   sess = tf_session.Session()
-  #   sess.run(variables.global_variables_initializer())
-  #   print(id(self._var_list))
-  #   calculate_list = []
+    Returns:
+      The operation to apply updates.
+    """
+    print("in child class : _finish()")
+    sess = tf_session.Session()
+    sess.run(variables.global_variables_initializer())
+    calculate_list = []
 
-    
+    for i in range(self._m):
+      # calculate loss(p_i) for particle i
+      for var in self._var_list:
+        p_i_d = self.get_slot(var, "p_" + str(i))
+        var_t = state_ops.assign(var, p_i_d)
+        # calculate_list.insert(0, var_t)
+        calculate_list.append(var_t)
+      loss_p_i = sess.run(self._loss)
+      print("loss_p_i", loss_p_i)
 
-  #   for i in range(self._m):
-  #     # calculate loss(p_i) for particle i
-  #     for var in self._var_list:
-  #       p_i_d = self.get_slot(var, "p_" + str(i))
-  #       var_t = state_ops.assign(var, p_i_d)
-  #       # calculate_list.insert(0, var_t)
-  #       calculate_list.append(var_t)
-  #     loss_p_i = sess.run(self._loss)
-  #     print("loss_p_i", loss_p_i)
+      # calculate loss(pBest_i) for particle i
+      for var in self._var_list:
+        pBest_i_d = self.get_slot(var, "pBest_" + str(i))
+        pBest_i_t = state_ops.assign(var, pBest_i_d)
+        # calculate_list.insert(0, pBest_i_t)
+        calculate_list.append(pBest_i_t)
+      loss_pBest_i = sess.run(self._loss)
+      print("loss_pBest_i", loss_pBest_i)
 
-  #     # calculate loss(pBest_i) for particle i
-  #     for var in self._var_list:
-  #       pBest_i_d = self.get_slot(var, "pBest_" + str(i))
-  #       pBest_i_t = state_ops.assign(var, pBest_i_d)
-  #       # calculate_list.insert(0, pBest_i_t)
-  #       calculate_list.append(pBest_i_t)
-  #     loss_pBest_i = sess.run(self._loss)
-  #     print("loss_pBest_i", loss_pBest_i)
+      # calculate loss(gBest)
+      for var in self._var_list:
+        gBest_d = self.get_slot(var, "gBest")
+        gBest_t = state_ops.assign(var, gBest_d)
+        # calculate_list.insert(0, gBest_t)
+        calculate_list.append(gBest_t)
+      loss_gBest = sess.run(self._loss)
+      print("loss_gBest", loss_gBest)
 
-  #     # calculate loss(gBest)
-  #     for var in self._var_list:
-  #       gBest_d = self.get_slot(var, "gBest")
-  #       gBest_t = state_ops.assign(var, gBest_d)
-  #       # calculate_list.insert(0, gBest_t)
-  #       calculate_list.append(gBest_t)
-  #     loss_gBest = sess.run(self._loss)
-  #     print("loss_gBest", loss_gBest)
+      '''
+        Attention!!!
+        I think I need to set loss-value into slot 
+        The calculate process should be ref
+      '''
 
-  #     '''
-  #       I think I need to set loss-value into slot 
-  #       The calculate process should be ref
-  #     '''
-
-  #     # p_compare_pBest = math_ops.cast(ops.convert_to_tensor(loss_p_i < loss_pBest_i, name="p_pBest_0"), var.dtype.base_dtype)
-  #     # pBest_compare_gBest = math_ops.cast(ops.convert_to_tensor(loss_pBest_i < loss_gBest, name="pBest_gBest"), var.dtype.base_dtype) 
-  #     # print("p_compare_pBest", sess.run(p_compare_pBest))
-  #     # print("pBest_compare_gBest", sess.run(pBest_compare_gBest))
-  #     p_compare_pBest = loss_p_i < loss_pBest_i
-  #     pBest_compare_gBest = loss_pBest_i < loss_gBest
-  #     print("p_compare_pBest", p_compare_pBest)
-  #     print("pBest_compare_gBest", pBest_compare_gBest)
+      # p_compare_pBest = math_ops.cast(ops.convert_to_tensor(loss_p_i < loss_pBest_i, name="p_pBest_0"), var.dtype.base_dtype)
+      # pBest_compare_gBest = math_ops.cast(ops.convert_to_tensor(loss_pBest_i < loss_gBest, name="pBest_gBest"), var.dtype.base_dtype) 
+      # print("p_compare_pBest", sess.run(p_compare_pBest))
+      # print("pBest_compare_gBest", sess.run(pBest_compare_gBest))
+      p_compare_pBest = loss_p_i < loss_pBest_i
+      pBest_compare_gBest = loss_pBest_i < loss_gBest
+      print("p_compare_pBest", p_compare_pBest)
+      print("pBest_compare_gBest", pBest_compare_gBest)
 
 
-  #     # calculate new pBest_i & gBest
-  #     for var in self._var_list:
-  #       pBest_i_d = self.get_slot(var, "pBest_" + str(i))
-  #       p_i_d = self.get_slot(var, "p_" + str(i))
-  #       gBest_d = self.get_slot(var, "gBest")
-  #       # cast loss_value into tensor
-  #       # pBest_t = state_ops.assign(pBest_i_d, p_compare_pBest * p_i_d)
-  #       pBest_t = state_ops.assign(pBest_i_d, p_i_d if p_compare_pBest else pBest_i_d)
-  #       # calculate_list.insert(0, pBest_t)
-  #       calculate_list.append(pBest_t)
-  #       # loss_pBest_i = math_ops.minimum(loss_p_i, loss_pBest_i)
-  #       gBest_t = state_ops.assign(gBest_d, p_i_d if p_compare_pBest * pBest_compare_gBest
-  #                                         else gBest_d)
-  #       # calculate_list.insert(0, gBest_t)
-  #       calculate_list.append(gBest_t)
-  #       loss_gBest = math_ops.minimum(loss_pBest_i, loss_gBest)
-  #     print("loss_gBest", sess.run(loss_gBest))
+      # calculate new pBest_i & gBest
+      for var in self._var_list:
+        pBest_i_d = self.get_slot(var, "pBest_" + str(i))
+        p_i_d = self.get_slot(var, "p_" + str(i))
+        gBest_d = self.get_slot(var, "gBest")
+        # cast loss_value into tensor
+        # pBest_t = state_ops.assign(pBest_i_d, p_compare_pBest * p_i_d)
+        pBest_t = state_ops.assign(pBest_i_d, p_i_d if p_compare_pBest else pBest_i_d)
+        # calculate_list.insert(0, pBest_t)
+        calculate_list.append(pBest_t)
+        # loss_pBest_i = math_ops.minimum(loss_p_i, loss_pBest_i)
+        gBest_t = state_ops.assign(gBest_d, p_i_d if p_compare_pBest * pBest_compare_gBest
+                                          else gBest_d)
+        # calculate_list.insert(0, gBest_t)
+        calculate_list.append(gBest_t)
+        loss_gBest = math_ops.minimum(loss_pBest_i, loss_gBest)
+      print("loss_gBest", sess.run(loss_gBest))
 
-  #     # TEST: update all val to gBest and calculate loss, compare it to line-279
-  #     for var in self._var_list:
-  #       gBest_d = self.get_slot(var, "gBest")
-  #       gBest_t = state_ops.assign(var, gBest_d)
-  #       # calculate_list.insert(0, gBest_t)
-  #       calculate_list.append(gBest_t)
-  #     loss_current = sess.run(self._loss)
-  #     print("loss_current(gBest)", loss_current)
+    # Update each var value to gBest
+    for var in self._var_list:
+        gBest_d = self.get_slot(var, "gBest")
+        gBest_t = state_ops.assign(var, gBest_d)
+        # calculate_list.insert(0, gBest_t)
+        calculate_list.append(gBest_t)
+    loss_current = sess.run(self._loss)
+    print("loss_current(gBest)", loss_current)
 
-  #     print("----------------------")
-
-  #     # TEST: update all val to gBest and calculate loss, compare it to line-279
-
-  #   # Update each var value to gBest
-  #   for var in self._var_list:
-  #       gBest_d = self.get_slot(var, "gBest")
-  #       gBest_t = state_ops.assign(var, gBest_d)
-  #       # calculate_list.insert(0, gBest_t)
-  #       calculate_list.append(gBest_t)
-  #   loss_current = sess.run(self._loss)
-  #   print("loss_current(gBest)", loss_current)
-
-  #   calculate_list = control_flow_ops.group(*calculate_list)
-  #   print("------------------")
-  #   # print(calculate_list)
-  #   print("------------------")
-  #   # update_ops.insert(0, calculate_list)
-  #   update_ops.append(calculate_list)
-  #   # print(*update_ops)    
-  #   return control_flow_ops.group(*update_ops, name=name_scope)
+    calculate_list = control_flow_ops.group(*calculate_list)
+    # update_ops.insert(0, calculate_list)
+    update_ops.append(calculate_list)  
+    return control_flow_ops.group(*update_ops, name=name_scope)
 
   def _random_slot(self, var, slot_name, op_name):
     """Find or create a slot initialized with random value.
@@ -334,8 +286,11 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
     Returns:
       A `Variable` object.
     """
-    # TO DO: re-write the following code to give slots a random value
+    # TO DO: re-write the following code to give slots a random value DONE!
     named_slots = self._slot_dict(slot_name)
     if _var_key(var) not in named_slots:
-      named_slots[_var_key(var)] = slot_creator.create_zeros_slot(var, op_name)
+      # named_slots[_var_key(var)] = slot_creator.create_zeros_slot(var, op_name)
+      var_shape = var.get_shape()
+      val_random = random_ops.random_uniform(var_shape, 0, 2)
+      named_slots[_var_key(var)] = slot_creator.create_slot(var, val_random, op_name)
     return named_slots[_var_key(var)]
