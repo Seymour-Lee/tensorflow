@@ -36,6 +36,7 @@ from tensorflow.python.ops import random_ops
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_math_ops
 from tensorflow.python.training import optimizer
+from tensorflow.python.training import adam
 from tensorflow.python.training import slot_creator
 
 from tensorflow.python.client import session as tf_session
@@ -172,22 +173,382 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
                gate_gradients=GATE_OP, aggregation_method=None,
                colocate_gradients_with_ops=False, name=None,
                grad_loss=None):
-    self._loss = loss
+    N_PARTICLES = 32
+    P_BEST_FACTOR = 0.6
+    G_BEST_FACTOR = 0.8
+    L_BEST_FACTOR = 0.7
+    # Velocity Decay specifies the multiplier for the velocity update
+    VELOCITY_DECAY = 1
+    # Velocity Restrict is computationally slightly more expensive
+    VELOCITY_RESTRICT = True
+    MAX_VEL = 0.005
+    # Allows to decay the maximum velocity with each update
+    # Useful if the network needs very fine tuning towards the end
+    MAX_VEL_DECAY = 1
 
-    if self._var_list is None:
-      self._var_list = (
-          variables.trainable_variables() +
-          ops.get_collection(ops.GraphKeys.TRAINABLE_RESOURCE_VARIABLES))
+    # Hybrid Parameters
+    HYBRID = True
+    LEARNING_RATE = 0.1
+    LBPSO = False
+
+
+    # Other Params
+    HIDDEN_LAYERS = args.hl
+
+    CHI = 1  # Temporary Fix
+
+
+    # Basic Neural Network Definition
+    # Simple feedforward Network
+    LAYERS = [N_IN] + HIDDEN_LAYERS # + [1]
+    print('Network Structure\t:', LAYERS)
+
+
+    t_VELOCITY_DECAY = tf.constant(value=VELOCITY_DECAY,
+                                   dtype=tf.float32,
+                                   name='vel_decay')
+    t_MVEL = tf.Variable(MAX_VEL,
+                         dtype=tf.float32,
+                         name='vel_restrict',
+                         trainable=False)
+    
+    # MULTI-PARTICLE NEURAL NETS
+
+    losses = []
+    nets = []
+    pweights = []
+    pbiases = []
+    vweights = []
+    vbiases = []
+
+    random_values = []
+
+    # Positional Updates
+    bias_updates = []
+    weight_updates = []
+
+    # Velocity Updates
+    vweight_updates = []
+    vbias_updates = []
+
+    # Fitness Updates
+    fit_updates = []
+
+
+    # Control Updates - Controling PSO inside tf.Graph
+    control_updates = []
+
+    # Hybrid Updates - Using of PSO + Traditional Approaches
+    hybrid_updates = []
+
+    gweights = None
+    gbiases = None
+    gfit = None
+
+    if not LBPSO:
+        gweights = []
+        gbiases = []
+        gfit = tf.Variable(float("inf"), name='gbestfit', trainable=False)
+
+    # TODO:Parellized the following loop
+    # TODO:See if the Conditional Function Lambdas can be optimized
+
+    for pno in range(N_PARTICLES):
+        weights = []
+        biases = []
+        pweights = []
+        pbiases = []
+        lweights = None
+        lbiases = None
+        if LBPSO:
+            # Initialize the list
+            lweights = []
+            lbiases = []
+        pbestrand = tf.Variable(tf.random_uniform(
+            shape=[], maxval=P_BEST_FACTOR),
+            name='pno' + str(pno + 1) + 'pbestrand',
+            trainable=False)
+        gbestrand = None
+        lbestrand = None
+        if not LBPSO:
+            gbestrand = tf.Variable(tf.random_uniform(
+                shape=[], maxval=G_BEST_FACTOR),
+                name='pno' + str(pno + 1) + 'gbestrand',
+                trainable=False)
+        else:
+            lbestrand = tf.Variable(tf.random_uniform(
+                shape=[], maxval=L_BEST_FACTOR),
+                name='pno' + str(pno + 1) + 'lbestrand',
+                trainable=False)
+
+        # Append the random values so that the initializer can be called again
+        random_values.append(pbestrand)
+        if not LBPSO:
+            random_values.append(gbestrand)
+        else:
+            random_values.append(lbestrand)
+        pfit = None
+        with tf.variable_scope("fitnessvals", reuse=tf.AUTO_REUSE):
+            init = tf.constant(float("inf"))
+            pfit = tf.get_variable(name=str(pno + 1),
+                                   initializer=init)
+
+        pfit = tf.Variable(float("inf"), name='pno' + str(pno + 1) + 'fit')
+
+        localfit = None
+        if LBPSO:
+            localfit = tf.Variable(float("inf"), name='pno' + str(pno + 1) + 'lfit')
+        net = net_in
+        # Define the parameters
+
+        for idx, num_neuron in enumerate(LAYERS[1:]):
+            layer_scope = 'pno' + str(pno + 1) + 'fc' + str(idx + 1)
+            net, pso_tupple = fc(input_tensor=net,
+                                 n_output_units=num_neuron,
+                                 activation_fn='softmax', # 'sigmoid',
+                                 scope=layer_scope,
+                                 uniform=True)
+            w, b, pw, pb, vw, vb = pso_tupple
+            vweights.append(vw)
+            vbiases.append(vb)
+            weights.append(w)
+            biases.append(b)
+            pweights.append(pw)
+            pbiases.append(pb)
+            lw = None
+            lb = None
+            if LBPSO:
+                lw = tf.Variable(pw.initialized_value(), name='lbest_w')
+                lb = tf.Variable(pb.initialized_value(), name='lbest_b')
+                lbiases.append(lb)
+                lweights.append(lw)
+
+            # Multiply by the Velocity Decay
+            nextvw = tf.multiply(vw, t_VELOCITY_DECAY)
+            nextvb = tf.multiply(vb, t_VELOCITY_DECAY)
+
+            # Differences between Particle Best & Current
+            pdiffw = tf.multiply(tf.subtract(pw, w), pbestrand)
+            pdiffb = tf.multiply(tf.subtract(pb, b), pbestrand)
+
+            # Differences between the Local Best & Current
+            ldiffw = None
+            ldiffb = None
+            if LBPSO:
+                ldiffw = tf.multiply(tf.subtract(lw, w), lbestrand)
+                ldiffb = tf.multiply(tf.subtract(lb, w), lbestrand)
+
+            # Define & Reuse the GBest
+            gw = None
+            gb = None
+            if not LBPSO:
+                with tf.variable_scope("gbest", reuse=tf.AUTO_REUSE):
+                    gw = tf.get_variable(name='fc' + str(idx + 1) + 'w',
+                                         shape=[LAYERS[idx], LAYERS[idx + 1]],
+                                         initializer=tf.zeros_initializer)
+
+                    gb = tf.get_variable(name='fc' + str(idx + 1) + 'b',
+                                         shape=[LAYERS[idx + 1]],
+                                         initializer=tf.zeros_initializer)
+
+            # If first Particle add to Global Else it is already present
+            if pno == 0 and not LBPSO:
+                gweights.append(gw)
+                gbiases.append(gb)
+            gdiffw = None
+            gdiffb = None
+            # Differences between Global Best & Current
+            if not LBPSO:
+                gdiffw = tf.multiply(tf.subtract(gw, w), gbestrand)
+                gdiffb = tf.multiply(tf.subtract(gb, b), gbestrand)
+            else:
+                ldiffw = tf.multiply(tf.subtract(lw, w), lbestrand)
+                ldiffb = tf.multiply(tf.subtract(lb, b), lbestrand)
+
+            vweightdiffsum = None
+            vbiasdiffsum = None
+            if LBPSO:
+                vweightdiffsum = tf.multiply(
+                    tf.add_n([nextvw, pdiffw, ldiffw]),
+                    CHI)
+                vbiasdiffsum = tf.multiply(tf.add_n([nextvb, pdiffb, ldiffb]), CHI)
+            else:
+                vweightdiffsum = tf.add_n([nextvw, pdiffw, gdiffw])
+                vbiasdiffsum = tf.add_n([nextvb, pdiffb, gdiffb])
+
+            vweight_update = None
+            if VELOCITY_RESTRICT is False:
+                vweight_update = tf.assign(vw, vweightdiffsum, validate_shape=True)
+            else:
+                vweight_update = tf.assign(vw, maxclip(vweightdiffsum, t_MVEL),
+                                           validate_shape=True)
+
+            vweight_updates.append(vweight_update)
+            vbias_update = None
+            if VELOCITY_RESTRICT is False:
+                vbias_update = tf.assign(vb, vbiasdiffsum, validate_shape=True)
+            else:
+                vbias_update = tf.assign(vb, maxclip(vbiasdiffsum, t_MVEL),
+                                         validate_shape=True)
+
+            vbias_updates.append(vbias_update)
+            weight_update = tf.assign(w, w + vw, validate_shape=True)
+            weight_updates.append(weight_update)
+            bias_update = tf.assign(b, b + vb, validate_shape=True)
+            bias_updates.append(bias_update)
+
+        # Define loss for each of the particle nets
+        loss = tf.nn.l2_loss(net - label)
+        # loss = tf.reduce_mean(-tf.reduce_sum(label*tf.log(net), reduction_indices=[1]))
+        particlebest = tf.cond(loss < pfit, lambda: loss, lambda: pfit)
+        fit_update = tf.assign(pfit, particlebest, validate_shape=True)
+        fit_updates.append(fit_update)
+        if not LBPSO:
+            globalbest = tf.cond(loss < gfit, lambda: loss, lambda: gfit)
+            fit_update = tf.assign(gfit, globalbest, validate_shape=True)
+            fit_updates.append(fit_update)
+        control_update = tf.assign(t_MVEL, tf.multiply(t_MVEL, MAX_VEL_DECAY),
+                                   validate_shape=True)
+        control_updates.append(control_update)
+        if HYBRID:
+            optimizer = adam.AdamOptimizer(learning_rate=LEARNING_RATE)
+            hybrid_update = optimizer.minimize(loss)
+            hybrid_updates.append(hybrid_update)
+
+        # Multiple Length Checks
+        assert len(weights) == len(biases)
+        assert len(pweights) == len(pbiases)
+        assert len(pweights) == len(weights)
+
+        for i in range(len(weights)):
+            # Particle Best
+            pweight = tf.cond(loss <= pfit, lambda: weights[
+                              i], lambda: pweights[i])
+            fit_update = tf.assign(pweights[i], pweight, validate_shape=True)
+            fit_updates.append(fit_update)
+            pbias = tf.cond(loss <= pfit, lambda: biases[i], lambda: pbiases[i])
+            fit_update = tf.assign(pbiases[i], pbias, validate_shape=True)
+            fit_updates.append(fit_update)
+
+            if LBPSO:
+                lneigh = (pno - 1) % N_PARTICLES
+                rneigh = (pno + 1) % N_PARTICLES
+                lneighscope = 'pno' + str(lneigh + 1) + 'fc' + str(i + 1)
+                rneighscope = 'pno' + str(rneigh + 1) + 'fc' + str(i + 1)
+                lneigh_weight = None
+                lneigh_bias = None
+                rneigh_weight = None
+                rneigh_bias = None
+                lfit = None
+                rfit = None
+
+                with tf.variable_scope(lneighscope, reuse=tf.AUTO_REUSE):
+                    lneigh_weight = tf.get_variable(
+                        shape=[LAYERS[i], LAYERS[i + 1]],
+                        name='pbest_w',
+                        initializer=tf.random_uniform_initializer)
+                    # [LAYERS[idx + 1]]
+                    lneigh_bias = tf.get_variable(
+                        shape=[LAYERS[i + 1]],
+                        name='pbest_b',
+                        initializer=tf.random_uniform_initializer)
+                with tf.variable_scope(rneighscope, reuse=tf.AUTO_REUSE):
+                    rneigh_weight = tf.get_variable(
+                        shape=[LAYERS[i], LAYERS[i + 1]],
+                        name='pbest_w',
+                        initializer=tf.random_uniform_initializer)
+                    # [LAYERS[idx + 1]]
+                    rneigh_bias = tf.get_variable(
+                        shape=[LAYERS[i + 1]],
+                        name='pbest_b',
+                        initializer=tf.random_uniform_initializer)
+
+                with tf.variable_scope("fitnessvals", reuse=tf.AUTO_REUSE):
+                    init = tf.constant(float("inf"))
+                    lfit = tf.get_variable(name=str(lneigh + 1), initializer=init)
+                    rfit = tf.get_variable(name=str(rneigh + 1), initializer=init)
+
+                new_local_weight = None
+                new_local_bias = None
+                new_local_fit = None
+
+                # Deal with Local Fitness
+                neighbor_best_fit = tf.cond(lfit <= rfit,
+                                            lambda: lfit, lambda: rfit)
+                particle_best_fit = tf.cond(pfit <= localfit,
+                                            lambda: pfit, lambda: localfit)
+                best_fit = tf.cond(neighbor_best_fit <= particle_best_fit,
+                                   lambda: neighbor_best_fit,
+                                   lambda: particle_best_fit)
+                fit_update = tf.assign(localfit, best_fit, validate_shape=True)
+                fit_updates.append(fit_update)
+
+                # Deal with Local Best Weights
+                neighbor_best_weight = tf.cond(lfit <= rfit,
+                                               lambda: lneigh_weight,
+                                               lambda: rneigh_weight)
+                particle_best_weight = tf.cond(pfit <= localfit,
+                                               lambda: pweights[i],
+                                               lambda: lweights[i])
+                best_weight = tf.cond(neighbor_best_fit <= particle_best_fit,
+                                      lambda: neighbor_best_weight,
+                                      lambda: particle_best_weight)
+                fit_update = tf.assign(
+                    lweights[i], best_weight, validate_shape=True)
+                fit_updates.append(fit_update)
+
+                # Deal with Local Best Biases
+                neighbor_best_bias = tf.cond(lfit <= rfit,
+                                             lambda: lneigh_bias,
+                                             lambda: rneigh_bias)
+                particle_best_bias = tf.cond(pfit <= localfit,
+                                             lambda: pbiases[i],
+                                             lambda: lbiases[i])
+                best_bias = tf.cond(neighbor_best_fit <= particle_best_fit,
+                                    lambda: neighbor_best_bias,
+                                    lambda: particle_best_bias)
+                fit_update = tf.assign(lbiases[i], best_bias, validate_shape=True)
+                fit_updates.append(fit_update)
+
+            if not LBPSO:
+                # Global Best
+                gweight = tf.cond(loss <= gfit,
+                                  lambda: weights[i],
+                                  lambda: gweights[i])
+                fit_update = tf.assign(gweights[i], gweight, validate_shape=True)
+                fit_updates.append(fit_update)
+                gbias = tf.cond(loss <= gfit,
+                                lambda: biases[i],
+                                lambda: gbiases[i])
+                fit_update = tf.assign(gbiases[i], gbias, validate_shape=True)
+                fit_updates.append(fit_update)
+
+        # Update the lists
+        nets.append(net)
+        losses.append(loss)
+        print_prog_bar(iteration=pno + 1,
+                       total=N_PARTICLES,
+                       suffix=str_memusage('M'))
+    print(nets)
+
+    msgtime('Completed\t\t:')
+
+    # Initialize the entire graph
+    init = tf.global_variables_initializer()
+    msgtime('Graph Init Successful\t:')
+
+    # Define the updates which are to be done before each iterations
+    random_updates = [r.initializer for r in random_values]
+    updates = weight_updates + bias_updates + \
+        random_updates + vbias_updates + vweight_updates + \
+        fit_updates + control_updates + hybrid_updates
+    req_list = None
+    if not LBPSO:
+        req_list = losses, updates, gfit, gbiases, vweights, vbiases, gweights
     else:
-      self._var_list = nest.flatten(self._var_list)
-    # pylint: disable=protected-access
-    self._var_list += ops.get_collection(ops.GraphKeys._STREAMING_MODEL_PORTS)
-
-    ret = super(ParticleSwarmOptimizer, self).minimize(loss, global_step, var_list,
-               gate_gradients, aggregation_method,
-               colocate_gradients_with_ops, name,
-               grad_loss)
-    return ret
+        req_list = losses, updates, vweights, vbiases
+    pass
+    
 
   def _finish(self, update_ops, name_scope):
     """Do what is needed to finish the update.
@@ -205,71 +566,6 @@ class ParticleSwarmOptimizer(optimizer.Optimizer):
       The operation to apply updates.
     """
     print("in child class : _finish()")
-    
-    calculate_list = []
-
-    for i in range(self._m):
-      # calculate loss(p_i) for particle i
-      for var in self._var_list:
-        p_i_d = self.get_slot(var, "p_" + str(i))
-        var_t = state_ops.assign(var, p_i_d)
-        calculate_list.insert(0, var_t)
-        # calculate_list.append(var_t)
-      update_fitness_pc = state_ops.assign(self._pc_loss[i], self._loss)
-      calculate_list.insert(0, update_fitness_pc)
-      # calculate_list.append(update_fitness_pc)
-
-      # calculate loss(pBest_i) for particle i
-      for var in self._var_list:
-        pBest_i_d = self.get_slot(var, "pBest_" + str(i))
-        pBest_i_t = state_ops.assign(var, pBest_i_d)
-        calculate_list.insert(0, pBest_i_t)
-        # calculate_list.append(pBest_i_t)
-      update_fitness_pBest = state_ops.assign(self._pBest_loss[i], self._loss)
-      calculate_list.insert(0, update_fitness_pBest)
-      # calculate_list.append(update_fitness_pBest)
-
-      # calculate loss(gBest)
-      for var in self._var_list:
-        gBest_d = self.get_slot(var, "gBest")
-        gBest_t = state_ops.assign(var, gBest_d)
-        calculate_list.insert(0, gBest_t)
-        # calculate_list.append(gBest_t)
-      update_fitness_gBest = state_ops.assign(self._gBest_loss[0], self._loss)
-      calculate_list.insert(0, update_fitness_gBest)
-      # calculate_list.append(update_fitness_gBest)
-
-      # calculate new pBest_i & gBest
-      for var in self._var_list:
-        pBest_i_d = self.get_slot(var, "pBest_" + str(i))
-        p_i_d = self.get_slot(var, "p_" + str(i))
-        gBest_d = self.get_slot(var, "gBest")
-        pBest_t = control_flow_ops.cond(
-          gen_math_ops.less(self._pc_loss[i], self._pBest_loss[i]),
-          lambda: state_ops.assign(pBest_i_d, p_i_d),
-          lambda: state_ops.assign(pBest_i_d, pBest_i_d),
-        )
-        calculate_list.insert(0, pBest_t)
-        # calculate_list.append(pBest_t)
-        gBest_t = control_flow_ops.cond(
-          gen_math_ops.less(self._pc_loss[i], self._gBest_loss[0]),
-          lambda: state_ops.assign(gBest_d, p_i_d),
-          lambda: state_ops.assign(gBest_d, gBest_d),
-        )
-        calculate_list.insert(0, gBest_t)
-        # calculate_list.append(gBest_t)
-
-    # Update each var value to gBest. This seems to be useless
-    for var in self._var_list:
-        gBest_d = self.get_slot(var, "gBest")
-        gBest_t = state_ops.assign(var, gBest_d)
-        calculate_list.insert(0, gBest_t)
-        # calculate_list.append(gBest_t)
-
-    calculate_list = control_flow_ops.group(*calculate_list)
-    print(calculate_list)
-    update_ops.insert(0, calculate_list)
-    # update_ops.append(calculate_list)  
     return control_flow_ops.group(*update_ops, name=name_scope)
 
   def _random_slot(self, var, slot_name, op_name):
